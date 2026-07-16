@@ -1,16 +1,258 @@
 
 name: Cytex Scan
+
+# Contract with the Cytex platform (scripts/github/github.py) — do not change lightly:
+#   * The workflow name "Cytex Scan" is how the platform locates runs of this workflow.
+#   * Exactly one job: the platform reads the logs of the run's first job.
+#   * Grype and Semgrep must print their JSON to stdout: findings are scraped from run logs.
+#   * The uploaded artifact must contain exactly one JSON file: the platform ingests every
+#     .json found in the run's artifacts as the scan report.
 on:
   push:
-    branches: ["master", "main"]
+    branches:
+      - "master"
+      - "main"
+  # The platform dispatches this workflow with the files changed since the last scanned
+  # commit; an empty value means "scan the whole repository".
+  workflow_dispatch:
+    inputs:
+      changedFiles:
+        description: "Comma-separated changed files for incremental scan (empty = full scan)"
+        required: false
+        default: ""
+
 jobs:
-  analyze:
-    name: Code analysis
+  scan:
+    name: Cytex security scan
     runs-on: ubuntu-latest
+    env:
+      # Reports live outside the workspace so the scanners never pick up their own output.
+      # Literal path: the runner context is not available in job-level env.
+      REPORT_DIR: /tmp/cytex-reports
+      AIBOM_VERSION: 1.0.0rc2
+      AIBOM_CATALOG_SHA256: b1165384a646094aa6a4762d676f285c1c68b6d7f9367c90a129b529904a3268
+      AIBOM_LLM_PROVIDER: groq
+      AIBOM_LLM_MODEL: llama-3.3-70b-versatile
     steps:
-      - run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-      - run: python3 -m pip install semgrep
-      - name: Checkout
-        uses: actions/checkout@v2
-      - run: grype dir:./ -o json
-      - run: semgrep --config=auto ./ --json
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Scanner versions are intentionally unpinned so vulnerability data stays current;
+      # the AIBOM release and its catalog are pinned and checksum-verified because AIBOM
+      # results must be reproducible against a known component knowledge base.
+      - name: Install scan toolchain
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          python3 -m pip install --quiet semgrep
+          python3 -m pip install --quiet --pre "cisco-aibom[agentic]==$AIBOM_VERSION" langchain-groq
+          mkdir -p ~/.aibom/catalogs
+          curl -sSfL -o ~/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb https://github.com/cisco-ai-defense/aibom/releases/download/$AIBOM_VERSION/aibom_catalog-$AIBOM_VERSION.duckdb
+          echo "$AIBOM_CATALOG_SHA256  $HOME/.aibom/catalogs/aibom_catalog-$AIBOM_VERSION.duckdb" | sha256sum -c -
+
+      # Full scans target the whole checkout. Incremental scans copy only the changed files
+      # that still exist into an isolated directory, so unchanged files are never rescanned
+      # and deleted files are skipped. An incremental scan where every changed file was
+      # since deleted still completes, with empty results.
+      - name: Resolve scan scope
+        env:
+          CHANGED_FILES: ${{ github.event.inputs.changedFiles }}
+        run: |
+          mkdir -p "$REPORT_DIR"
+          SCAN_TYPE=full
+          SCAN_DIR=.
+          CHANGED_FILE_COUNT=0
+          if [ -n "$CHANGED_FILES" ]; then
+            SCAN_TYPE=incremental
+            SCAN_DIR=$(mktemp -d)
+            IFS=',' read -ra CHANGED <<< "$CHANGED_FILES"
+            for path in "${CHANGED[@]}"; do
+              if [ -f "$path" ]; then
+                mkdir -p "$SCAN_DIR/$(dirname "$path")"
+                cp "$path" "$SCAN_DIR/$path"
+              fi
+            done
+            CHANGED_FILE_COUNT=$(find "$SCAN_DIR" -type f | wc -l)
+            echo "Incremental scan: $CHANGED_FILE_COUNT of ${#CHANGED[@]} changed path(s) still exist"
+          fi
+          {
+            echo "SCAN_TYPE=$SCAN_TYPE"
+            echo "SCAN_DIR=$SCAN_DIR"
+            echo "CHANGED_FILE_COUNT=$CHANGED_FILE_COUNT"
+          } >> "$GITHUB_ENV"
+
+      # Each scanner records its exit code instead of failing the job: one broken tool must
+      # not discard the results of the others. Failures surface in the consolidated report.
+      - name: Generate SBOM (Syft)
+        run: |
+          set +e
+          syft "dir:$SCAN_DIR" -o cyclonedx-json > "$REPORT_DIR/sbom.cdx.json"
+          echo "SYFT_STATUS=$?" >> "$GITHUB_ENV"
+
+      # Grype emits JSON to stdout for the platform's log scraper and CycloneDX to a file
+      # for the consolidated report.
+      - name: Scan dependencies for vulnerabilities (Grype)
+        run: |
+          set +e
+          grype "dir:$SCAN_DIR" -o json -o cyclonedx-json="$REPORT_DIR/grype.cdx.json"
+          echo "GRYPE_STATUS=$?" >> "$GITHUB_ENV"
+
+      # tee keeps Semgrep's JSON on stdout for the platform's log scraper while capturing
+      # it for the consolidated report.
+      - name: Static analysis (Semgrep)
+        run: |
+          set +e
+          semgrep --config=auto "$SCAN_DIR" --json | tee "$REPORT_DIR/semgrep.json"
+          echo "SEMGREP_STATUS=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+
+      - name: Generate AIBOM (Cisco AIBOM)
+        env:
+          AIBOM_LLM_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          set +e
+          cisco-aibom analyze "$SCAN_DIR" -o cyclonedx -O "$REPORT_DIR/aibom.cdx.json" --llm-model "$AIBOM_LLM_MODEL" --llm-provider "$AIBOM_LLM_PROVIDER" --llm-api-key "$AIBOM_LLM_API_KEY"
+          echo "AIBOM_STATUS=$?" >> "$GITHUB_ENV"
+
+      # Single source of truth: merge every intermediate output into one CycloneDX document.
+      # The AIBOM document is the base so "components" and "metadata" stay top-level (the
+      # platform's ingester requires that shape). SBOM components/dependencies and Grype
+      # vulnerabilities are merged in with a _source tag; Semgrep findings and scan metadata
+      # (scan type, repo, branch, commit, timestamps, tool status, severity counts) live
+      # under their own keys. Missing intermediate files are tolerated so a partial scan
+      # still produces a report; runs even when a scanner step failed hard.
+      - name: Consolidate scan report
+        if: always()
+        env:
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          mkdir -p "$REPORT_DIR"
+          export SCAN_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          export SCAN_PREFIX=$(realpath "${SCAN_DIR:-.}")
+          export WORKSPACE=$(pwd)
+          python3 - <<'PYEOF'
+          import json
+          import os
+
+          report_dir = os.environ["REPORT_DIR"]
+
+          def load(name):
+              path = os.path.join(report_dir, name)
+              if not os.path.exists(path):
+                  return {}
+              try:
+                  with open(path) as fh:
+                      return json.load(fh)
+              except (ValueError, OSError):
+                  return {}
+
+          sbom = load("sbom.cdx.json")
+          aibom = load("aibom.cdx.json")
+          grype = load("grype.cdx.json")
+          semgrep = load("semgrep.json")
+
+          # Strip absolute runner paths (workspace or the incremental temp dir) so file
+          # references are repo-relative and identical between full and incremental scans.
+          prefixes = sorted(
+              {p.rstrip("/") + "/" for p in (os.environ.get("SCAN_PREFIX", ""), os.environ.get("WORKSPACE", "")) if p and p != "/"},
+              key=len, reverse=True,
+          )
+
+          def norm(value):
+              if isinstance(value, str):
+                  for prefix in prefixes:
+                      value = value.replace(prefix, "")
+                  return value
+              if isinstance(value, list):
+                  return [norm(item) for item in value]
+              if isinstance(value, dict):
+                  return {key: norm(item) for key, item in value.items()}
+              return value
+
+          def tools_of(doc):
+              tools = (doc.get("metadata") or {}).get("tools")
+              if isinstance(tools, dict):
+                  return [t for t in tools.get("components") or [] if isinstance(t, dict)]
+              if isinstance(tools, list):
+                  return [t for t in tools if isinstance(t, dict)]
+              return []
+
+          def tag(items, source):
+              return [dict(item, _source=source) for item in items]
+
+          combined = dict(aibom) if aibom else {"bomFormat": "CycloneDX", "specVersion": "1.5", "components": [], "metadata": {}}
+          tools = tools_of(sbom)
+          for extra in tools_of(aibom) + tools_of(grype):
+              if extra not in tools:
+                  tools.append(extra)
+          combined.setdefault("metadata", {})["tools"] = tools
+          for key in ("components", "dependencies", "vulnerabilities"):
+              merged = tag(sbom.get(key) or [], "sbom") + tag(aibom.get(key) or [], "aibom")
+              if key == "vulnerabilities":
+                  merged += tag(grype.get(key) or [], "grype")
+              if merged:
+                  combined[key] = merged
+
+          findings = semgrep.get("results") or []
+          severity_counts = {}
+          for vuln in combined.get("vulnerabilities") or []:
+              ratings = vuln.get("ratings") or [{}]
+              severity = str(ratings[0].get("severity", "unknown")).lower()
+              severity_counts[severity] = severity_counts.get(severity, 0) + 1
+          sast_counts = {}
+          for finding in findings:
+              severity = str((finding.get("extra") or {}).get("severity", "unknown")).lower()
+              sast_counts[severity] = sast_counts.get(severity, 0) + 1
+
+          combined["semgrep"] = {"results": findings, "severityCounts": sast_counts}
+          combined["cytexScan"] = {
+              "scanType": os.environ.get("SCAN_TYPE", "full"),
+              "repository": os.environ.get("REPO", ""),
+              "branch": os.environ.get("BRANCH", ""),
+              "commitSha": os.environ.get("COMMIT_SHA", ""),
+              "runId": os.environ.get("RUN_ID", ""),
+              "runAttempt": os.environ.get("RUN_ATTEMPT", ""),
+              "trigger": os.environ.get("EVENT_NAME", ""),
+              "timestampUtc": os.environ.get("SCAN_TIMESTAMP", ""),
+              "changedFileCount": int(os.environ.get("CHANGED_FILE_COUNT", "0") or 0),
+              "toolStatus": {
+                  "syft": os.environ.get("SYFT_STATUS", ""),
+                  "grype": os.environ.get("GRYPE_STATUS", ""),
+                  "semgrep": os.environ.get("SEMGREP_STATUS", ""),
+                  "aibom": os.environ.get("AIBOM_STATUS", ""),
+              },
+              "summary": {
+                  "components": len(combined.get("components") or []),
+                  "dependencies": len(combined.get("dependencies") or []),
+                  "vulnerabilities": len(combined.get("vulnerabilities") or []),
+                  "sastFindings": len(findings),
+                  "severityCounts": severity_counts,
+                  "sastSeverityCounts": sast_counts,
+              },
+              "artifacts": {
+                  "report": "cytex-scan-report.json",
+                  "sources": ["sbom.cdx.json", "aibom.cdx.json", "grype.cdx.json", "semgrep.json"],
+              },
+          }
+
+          combined = norm(combined)
+          with open(os.path.join(report_dir, "cytex-scan-report.json"), "w") as fh:
+              json.dump(combined, fh, indent=2, sort_keys=True)
+          print("Consolidated report: components=%d vulnerabilities=%d sast=%d" % (
+              len(combined.get("components") or []),
+              len(combined.get("vulnerabilities") or []),
+              len(findings)))
+          PYEOF
+
+      # Only the consolidated report is uploaded: the platform parses every .json in the
+      # run's artifacts, so intermediate files must stay out of the artifact.
+      - name: Upload consolidated report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cytex-scan-report
+          path: ${{ env.REPORT_DIR }}/cytex-scan-report.json
